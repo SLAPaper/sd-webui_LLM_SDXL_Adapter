@@ -73,15 +73,15 @@ class LLMToSDXLAdapter(nn.Module):
     Supports various LLM architectures (Gemma, Llama, Mistral, etc.)
     """
     def __init__(self,
-                 llm_dim=1152,              # Changed from gemma_dim to llm_dim
-                 sdxl_seq_dim=2048,
-                 sdxl_pooled_dim=1280,
-                 max_input_len=512,
-                 target_seq_len=308,
-                 n_wide_blocks=3,        # Blocks BEFORE compression
-                 n_narrow_blocks=3,      # Blocks AFTER compression
-                 num_heads=16,
-                 dropout=0):
+                 llm_dim: int=1152,              # Changed from gemma_dim to llm_dim
+                 sdxl_seq_dim: int=2048,
+                 sdxl_pooled_dim: int=1280,
+                 max_input_len: int=512,
+                 target_seq_len: int=308,
+                 n_wide_blocks: int=3,        # Blocks BEFORE compression
+                 n_narrow_blocks: int=3,      # Blocks AFTER compression
+                 num_heads: int=16,
+                 dropout: float=0):
         super().__init__()
 
         self.max_input_len = max_input_len

@@ -16,7 +16,7 @@ class LLMAdapterLoader:
     def __init__(self):
         self.adapter = None
         self.current_adapter_path = None
-        self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     @classmethod
     def INPUT_TYPES(cls):
@@ -82,8 +82,8 @@ class LLMAdapterLoader:
     FUNCTION = "load_adapter"
     CATEGORY = "llm_sdxl"
     
-    def load_adapter(self, adapter_name, llm_dim=1152, sdxl_seq_dim=2048, sdxl_pooled_dim=1280, 
-                    target_seq_len=308, n_wide_blocks=2, n_narrow_blocks=3, num_heads=16, dropout=0.1, device="auto", force_reload=False):
+    def load_adapter(self, adapter_name, llm_dim: int=1152, sdxl_seq_dim: int=2048, sdxl_pooled_dim: int=1280, 
+                    target_seq_len: int=308, n_wide_blocks: int=2, n_narrow_blocks: int=3, num_heads: int=16, dropout: float=0.1, device="auto", force_reload=False):
         """Load and initialize the LLM to SDXL adapter"""
         if device == "auto":
             device = self.device

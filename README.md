@@ -1,3 +1,11 @@
+# SD Webui LLM SDXL Adapter
+
+Implement Gemini3-1B Adapter for SDXL, porting from original ComfyUI custom node.
+
+**WARNING:** Currently the script is working but the effect is not satisfying. Constantly getting NaNs in the output. The mixing method of original embeds and llm embeds is to be further investigated.
+
+Below is the ComfyUI readme:
+
 # ComfyUI LLM SDXL Adapter
 
 ![Version](https://img.shields.io/badge/version-1.2.2-blue.svg)
