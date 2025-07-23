@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools as ft
 import logging
-from multiprocessing import pool
 import pathlib
 import typing as tg
 
@@ -29,7 +27,6 @@ from modules import devices, errors, script_callbacks, scripts
 from modules.processing import Processed, StableDiffusionProcessing
 from modules.shared import cmd_opts
 
-import snoop
 
 logger = logging.getLogger("LLM-SDXL-Adapter")
 logger.setLevel(logging.INFO)
@@ -54,16 +51,17 @@ if (
 logger.info(f"LLM SDXL Adapter Gemma Path: {gemma_path}, Adapter Path: {adapter_path}")
 
 
-def set_nan_to_zero(x: torch.Tensor) -> torch.Tensor:
+def set_nan_to_zero(x: torch.Tensor, tag: str = "") -> torch.Tensor:
     """
     Set NaN values in the tensor to zero
     Args:
         x: Input tensor
+        tag: Optional tag for logging
     Returns:
         Tensor with NaN values replaced by zero
     """
     if torch.isnan(x).any():
-        logger.warning("NaN values found in tensor, replacing with zero")
+        logger.warning("NaN values found in tensor [{tag}], replacing with zero")
         x = torch.nan_to_num(x, nan=0.0)
     return x
 
@@ -74,6 +72,7 @@ def apply_llm_adaptation(
     original_strength: float,
     llm_strength: float,
     pooled_llm_strength: float,
+    tag: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply LLM adaptation to SDXL embeddings with adapter and strength control
@@ -82,34 +81,47 @@ def apply_llm_adaptation(
         llm_embeds: LLM embeddings ([1, seq_len, embed_dim], [1, embed_dim])
         original_strength: Original strength of SDXL embeddings (0-1)
         llm_strength: Adaptation strength (0-10)
+        pooled_llm_strength: Strength for pooled embeddings (0-1)
+        tag: Optional tag for logging
     Returns:
         Adapted embeddings { "cross_attn": [batch, seq_len, embed_dim], "vector": [batch, embed_dim]}
     """
     # cross_attn for normal conditioning
-    sdxl_cross_attn = sdxl_embeds[0]
-    llm_cross_attn = set_nan_to_zero(llm_embeds[0])
-    batch_size = sdxl_cross_attn.shape[0]
-    new_cross_attn = torch.cat(
-        [
-            original_strength * sdxl_cross_attn,
-            llm_strength * llm_cross_attn.repeat(batch_size, 1, 1),
-        ],
-        dim=1,
-    )
+    if llm_strength > 0:
+        sdxl_cross_attn = sdxl_embeds[0]
+        llm_cross_attn = set_nan_to_zero(llm_embeds[0], tag=f"{tag} cross_attn")
+        batch_size = sdxl_cross_attn.shape[0]
+        new_cross_attn = torch.cat(
+            [
+                original_strength * sdxl_cross_attn,
+                llm_strength * llm_cross_attn.repeat(batch_size, 1, 1),
+            ],
+            dim=1,
+        )
+    else:
+        new_cross_attn = sdxl_embeds[0]
+        logger.info(f"LLM strength is zero, using original SDXL cross_attn {tag}")
 
     # vector for pooled conditioning
-    sdxl_vector = sdxl_embeds[1]
-    llm_vector = set_nan_to_zero(llm_embeds[1])
-    batch_size = sdxl_vector.shape[0]
-    hidden_dim = sdxl_vector.shape[1]
+    if pooled_llm_strength > 0:
+        sdxl_vector = sdxl_embeds[1]
+        llm_vector = set_nan_to_zero(llm_embeds[1], tag=f"{tag} vector")
+        batch_size = sdxl_vector.shape[0]
 
-    # for some reason the llm_adapter output 1x1280 while SDXL expects 1x2816, so pad it here
-    padded_llm_vector = torch.nn.functional.pad(
-        llm_vector, (0, hidden_dim - llm_vector.shape[1]), "constant", 0.0
-    )
-    new_vector = (
-        1 - pooled_llm_strength
-    ) * sdxl_vector + pooled_llm_strength * padded_llm_vector.repeat(batch_size, 1)
+        # for some reason the llm_adapter output 1x1280 while SDXL expects 1x2816, so split first
+        # It seems that the remaining 1536 dimensions are the extra embeddings for image size and other features
+        # original_size, crop_topleft, target_size (256*3*2, sgm.modules.encoders.modules.ConcatTimestepEmbedderND)
+        sdxl_front = sdxl_vector[:, : llm_vector.shape[1]]
+        sdxl_back = sdxl_vector[:, llm_vector.shape[1] :]
+
+        new_front = (
+            1 - pooled_llm_strength
+        ) * sdxl_front + pooled_llm_strength * llm_vector.repeat(batch_size, 1)
+
+        new_vector = torch.cat([new_front, sdxl_back], dim=1)
+    else:
+        new_vector = sdxl_embeds[1]
+        logger.info(f"Pooled LLM strength is zero, using original SDXL vector {tag}")
 
     return new_cross_attn, new_vector
 
@@ -187,7 +199,6 @@ class LLM_SDXL_Adapter:
         if self.adapter is not None:
             self.adapter = self.adapter.to("cpu")
 
-    # @ft.lru_cache(maxsize=100)
     def generate_embeddings(
         self, text: str
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -196,34 +207,25 @@ class LLM_SDXL_Adapter:
             return None
 
         try:
-            hidden_states, _ = self.text_encoder.encode_text(
+            hidden_states, info = self.text_encoder.encode_text(
                 self.model,
                 self.tokenizer,
                 text,
                 system_prompt="Describe this image prompt in detail",
                 device=self.device,
+                skip_first=0,
             )
-            compressed_sequence, pooled_output = self.adapter.forward(hidden_states)
+            logger.info(f"Generated embeddings: {info}")
+            with torch.no_grad():
+                compressed_sequence, pooled_output = self.adapter(hidden_states)
             return compressed_sequence, pooled_output
         except Exception as e:
             logger.error(f"Error generating embeddings: {e}")
             errors.display(e, "LLM SDXL Adapter Embedding Generation")
             return None
 
-    # @snoop.snoop(
-    #     watch_explode=[
-    #         "params",
-    #         "params.text_cond",
-    #         "params.text_uncond",
-    #         "self.prompt_embeds",
-    #         "self.negative_embeds",
-    #     ]
-    # )
     def on_cfg_denoiser(self, params: script_callbacks.CFGDenoiserParams) -> None:
         """Callback for modifying text conditioning in CFG denoiser"""
-        if self.prompt_embeds is None or self.negative_embeds is None:
-            return
-
         if not isinstance(params.text_cond, dict) or not isinstance(
             params.text_uncond, dict
         ):
@@ -231,25 +233,29 @@ class LLM_SDXL_Adapter:
             return
 
         # SDXL case
-        cond_crossattn, cond_vector = apply_llm_adaptation(
-            (params.text_cond["crossattn"], params.text_cond["vector"]),
-            self.prompt_embeds,
-            self.original_strength,
-            self.llm_strength,
-            self.pooled_llm_strength,
-        )
-        params.text_cond["crossattn"] = cond_crossattn
-        params.text_cond["vector"] = cond_vector
+        if self.prompt_embeds is not None:
+            cond_crossattn, cond_vector = apply_llm_adaptation(
+                (params.text_cond["crossattn"], params.text_cond["vector"]),
+                self.prompt_embeds,
+                self.original_strength,
+                self.llm_strength,
+                self.pooled_llm_strength,
+                tag="text_cond",
+            )
+            params.text_cond["crossattn"] = cond_crossattn
+            params.text_cond["vector"] = cond_vector
 
-        uncond_crossattn, uncond_vector = apply_llm_adaptation(
-            (params.text_uncond["crossattn"], params.text_uncond["vector"]),
-            self.negative_embeds,
-            self.original_strength,
-            self.llm_strength,
-            self.pooled_llm_strength,
-        )
-        params.text_uncond["crossattn"] = uncond_crossattn
-        params.text_uncond["vector"] = uncond_vector
+        if self.negative_embeds is not None:
+            uncond_crossattn, uncond_vector = apply_llm_adaptation(
+                (params.text_uncond["crossattn"], params.text_uncond["vector"]),
+                self.negative_embeds,
+                self.original_strength,
+                self.llm_strength,
+                self.pooled_llm_strength,
+                tag="text_uncond",
+            )
+            params.text_uncond["crossattn"] = uncond_crossattn
+            params.text_uncond["vector"] = uncond_vector
 
 
 G_LLM_SDXL_ADAPTER = LLM_SDXL_Adapter()
@@ -277,7 +283,7 @@ class LLM_SDXL_Adapter_Script(scripts.Script):
             original_strength = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
-                step=0.1,
+                step=0.01,
                 value=1.0,
                 label="Orignal Strength",
                 elem_id="llm_sdxl_original_strength",
@@ -285,9 +291,9 @@ class LLM_SDXL_Adapter_Script(scripts.Script):
 
             llm_strength = gr.Slider(
                 minimum=0.0,
-                maximum=10.0,
-                step=0.1,
-                value=3.0,
+                maximum=1.0,
+                step=0.01,
+                value=1.0,
                 label="Adapter Strength",
                 elem_id="llm_sdxl_adapter_strength",
             )
@@ -295,7 +301,7 @@ class LLM_SDXL_Adapter_Script(scripts.Script):
             pooled_llm_strength = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
-                step=0.1,
+                step=0.01,
                 value=0.5,
                 label="Pooled LLM Strength",
                 elem_id="llm_sdxl_pooled_llm_strength",
@@ -353,31 +359,46 @@ class LLM_SDXL_Adapter_Script(scripts.Script):
 
             G_LLM_SDXL_ADAPTER._move_to_cpu()
 
-            if prompt_embeds is None or negative_embeds is None:
-                logger.error("Failed to generate embeddings, adapter disabled")
-                return
-
             # Store embeddings and hashes
-            G_LLM_SDXL_ADAPTER.prompt_embeds = prompt_embeds
-            G_LLM_SDXL_ADAPTER.negative_embeds = negative_embeds
-            G_LLM_SDXL_ADAPTER.last_prompt_hash = current_prompt_hash
-            G_LLM_SDXL_ADAPTER.last_negative_hash = current_negative_hash
+            if prompt_embeds is not None:
+                G_LLM_SDXL_ADAPTER.prompt_embeds = prompt_embeds
+                G_LLM_SDXL_ADAPTER.last_prompt_hash = current_prompt_hash
+            else:
+                logger.error(
+                    "Failed to generate prompt embeddings, adapter won't affect positive prompt"
+                )
+
+            if negative_embeds is not None:
+                G_LLM_SDXL_ADAPTER.negative_embeds = negative_embeds
+                G_LLM_SDXL_ADAPTER.last_negative_hash = current_negative_hash
+            else:
+                logger.error(
+                    "Failed to generate negative embeddings, adapter won't affect negative prompt"
+                )
+
             G_LLM_SDXL_ADAPTER.original_strength = orignal_strength
             G_LLM_SDXL_ADAPTER.llm_strength = llm_strength
             G_LLM_SDXL_ADAPTER.pooled_llm_strength = pooled_llm_strength
 
-        p.extra_generation_params.update(
-            {
-                "LLM SDXL Adapter Enabled": True,
-                "LLM SDXL Orignal Strength": orignal_strength,
-                "LLM SDXL Adapter Strength": llm_strength,
-                "LLM SDXL Pooled LLM Strength": pooled_llm_strength,
-            }
-        )
+        if any(
+            x is not None
+            for x in (
+                G_LLM_SDXL_ADAPTER.prompt_embeds,
+                G_LLM_SDXL_ADAPTER.negative_embeds,
+            )
+        ):
+            p.extra_generation_params.update(
+                {
+                    "LLM SDXL Adapter Enabled": True,
+                    "LLM SDXL Orignal Strength": orignal_strength,
+                    "LLM SDXL Adapter Strength": llm_strength,
+                    "LLM SDXL Pooled LLM Strength": pooled_llm_strength,
+                }
+            )
 
-        logger.info(
-            f"LLM SDXL Adapter active with {orignal_strength=}, {llm_strength=}, {pooled_llm_strength=}"
-        )
+            logger.info(
+                f"LLM SDXL Adapter active with {orignal_strength=}, {llm_strength=}, {pooled_llm_strength=}"
+            )
 
     def postprocess(
         self,
